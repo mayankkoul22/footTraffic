@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base theme -->
+    <style name="Theme.FootTrafficCounter" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Primary brand color -->
+        <item name="colorPrimary">#3B82F6</item>
+        <item name="colorPrimaryVariant">#2563EB</item>
+        <item name="colorOnPrimary">@android:color/white</item>
+
+        <!-- Secondary brand color -->
+        <item name="colorSecondary">#10B981</item>
+        <item name="colorSecondaryVariant">#059669</item>
+        <item name="colorOnSecondary">@android:color/white</item>
+
+        <!-- Background colors -->
+        <item name="android:colorBackground">#1A1A2E</item>
+        <item name="colorOnBackground">@android:color/white</item>
+
+        <!-- Surface colors -->
+        <item name="colorSurface">#0F3460</item>
+        <item name="colorOnSurface">@android:color/white</item>
+
+        <!-- Error colors -->
+        <item name="colorError">#EF4444</item>
+        <item name="colorOnError">@android:color/white</item>
+
+        <!-- Status bar -->
+        <item name="android:statusBarColor">#1A1A2E</item>
+        <item name="android:navigationBarColor">#1A1A2E</item>
+
+        <!-- Window background -->
+        <item name="android:windowBackground">#1A1A2E</item>
+    </style>
+    <style name="Theme.Transparent.NoUi" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
+
+</resources>

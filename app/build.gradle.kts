@@ -1,7 +1,8 @@
 plugins {
     id("com.android.application")
     id("kotlin-android")
-    id("kotlin-kapt")
+   // id("kotlin-kapt")
+    id("com.google.devtools.ksp") version "2.0.21-1.0.27"
     id("kotlin-parcelize")
 }
 
@@ -65,7 +66,7 @@ dependencies {
     implementation("androidx.room:room-runtime:2.6.1")
 
     // Room compiler (annotation processor)
-    kapt("androidx.room:room-compiler:2.6.1")
+    ksp("androidx.room:room-compiler:2.6.1")
 
     // Optional: Kotlin extensions and coroutines support for Room
     implementation("androidx.room:room-ktx:2.6.1")
@@ -76,6 +77,9 @@ dependencies {
     implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
     implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
     implementation("org.tensorflow:tensorflow-lite-metadata:0.4.4")
+
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.16.1")
+    //implementation("org.tensorflow:tensorflow-lite-gpu-delegate-plugin:0.4.0") // Add this plugin
 
 
 
@@ -88,8 +92,8 @@ dependencies {
     implementation("androidx.camera:camera-view:1.3.1")
 
     implementation("com.github.bumptech.glide:glide:4.16.0")
-    kapt("com.github.bumptech.glide:compiler:4.16.0")
-
+    ksp("com.github.bumptech.glide:compiler:4.16.0")
+    //implementation("org.xerial:sqlite-jdbc:3.41.2.2")
     // Add this to your app/build.gradle dependencies
     implementation("androidx.lifecycle:lifecycle-process:2.8.4")
     implementation("androidx.lifecycle:lifecycle-service:2.8.4")

@@ -2,6 +2,8 @@ package com.datafy.foottraffic.detection
 
 import android.content.Context
 import android.graphics.*
+import androidx.annotation.OptIn
+import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageProxy
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.CompatibilityList
@@ -45,33 +47,40 @@ class YoloDetector(private val context: Context) {
             val modelBuffer = loadModelFile()
 
             val options = Interpreter.Options().apply {
-                setNumThreads(numThreads)
+                setNumThreads(4)
 
-                try {
-                    // ✅ Safe GPU delegate init
-                    gpuDelegate = GpuDelegate()
-                    addDelegate(gpuDelegate)
-                    Timber.d("GPU delegate enabled for YOLO")
-                } catch (e: Throwable) {
-                    Timber.w("GPU delegate not available, falling back to CPU: $e")
+                // Simplified GPU delegate setup
+                val compatList = CompatibilityList()
+                if (compatList.isDelegateSupportedOnThisDevice) {
+                    try {
+                        gpuDelegate = GpuDelegate()
+                        addDelegate(gpuDelegate)
+                        Timber.d("GPU acceleration enabled for YOLO")
+                    } catch (e: Exception) {
+                        Timber.w(e, "GPU acceleration failed, falling back to NNAPI/CPU")
+                        try {
+                            setUseNNAPI(true)
+                            Timber.d("Using NNAPI acceleration")
+                        } catch (nnapiException: Exception) {
+                            Timber.w(nnapiException, "NNAPI also failed, using CPU only")
+                        }
+                    }
+                } else {
+                    try {
+                        setUseNNAPI(true)
+                        Timber.d("GPU not supported, using NNAPI acceleration")
+                    } catch (e: Exception) {
+                        Timber.w(e, "NNAPI failed, using CPU only")
+                    }
                 }
             }
 
             interpreter = Interpreter(modelBuffer, options)
-            Timber.d("YOLO model loaded: $MODEL_PATH")
+            logModelInfo()
 
         } catch (e: Exception) {
             Timber.e(e, "Failed to load YOLO model")
-        }
-    }
-
-
-    private fun tryNNAPIFallback(options: Interpreter.Options) {
-        try {
-            options.setUseNNAPI(true)
-            Timber.d("Using NNAPI acceleration")
-        } catch (e: Exception) {
-            Timber.w(e, "NNAPI also failed, using CPU only")
+            loadModelCpuOnly()
         }
     }
 
@@ -82,65 +91,42 @@ class YoloDetector(private val context: Context) {
 
             val options = Interpreter.Options().apply {
                 setNumThreads(4)
-                // Explicitly disable any acceleration
-                setUseNNAPI(false)
             }
 
             interpreter = Interpreter(modelBuffer, options)
-
-            if (interpreter == null) {
-                throw RuntimeException("Failed to create CPU-only interpreter")
-            }
-
             Timber.d("YOLO model loaded with CPU only")
             logModelInfo()
 
         } catch (e: Exception) {
             Timber.e(e, "Failed to load model even with CPU only")
-            cleanup()
             throw RuntimeException("Cannot load YOLO model. Please ensure ${MODEL_PATH} exists in assets folder", e)
         }
     }
 
     private fun logModelInfo() {
         try {
-            interpreter?.let { interp ->
-                val inputTensor = interp.getInputTensor(0)
-                val outputTensor = interp.getOutputTensor(0)
-
-                if (inputTensor != null && outputTensor != null) {
-                    val inputShape = inputTensor.shape()
-                    val outputShape = outputTensor.shape()
-                    Timber.d("Model loaded successfully:")
-                    Timber.d("  Input shape: ${inputShape?.contentToString()}")
-                    Timber.d("  Output shape: ${outputShape?.contentToString()}")
-                    Timber.d("  Input data type: ${inputTensor.dataType()}")
-                    Timber.d("  Output data type: ${outputTensor.dataType()}")
-                } else {
-                    Timber.w("Could not retrieve tensor information")
-                }
-            }
+            val inputShape = interpreter?.getInputTensor(0)?.shape()
+            val outputShape = interpreter?.getOutputTensor(0)?.shape()
+            Timber.d("Model loaded - Input: ${inputShape?.contentToString()}, Output: ${outputShape?.contentToString()}")
         } catch (e: Exception) {
             Timber.w(e, "Could not log model info")
         }
     }
 
     private fun loadModelFile(): ByteBuffer {
-        return try {
-            context.assets.openFd(MODEL_PATH).use { fileDescriptor ->
-                FileInputStream(fileDescriptor.fileDescriptor).use { inputStream ->
-                    val fileChannel = inputStream.channel
-                    val startOffset = fileDescriptor.startOffset
-                    val declaredLength = fileDescriptor.declaredLength
+        try {
+            val fileDescriptor = context.assets.openFd(MODEL_PATH)
+            val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
+            val fileChannel = inputStream.channel
+            val startOffset = fileDescriptor.startOffset
+            val declaredLength = fileDescriptor.declaredLength
 
-                    fileChannel.map(
-                        FileChannel.MapMode.READ_ONLY,
-                        startOffset,
-                        declaredLength
-                    ).apply {
-                        order(ByteOrder.nativeOrder())
-                    }
-                }
+            return fileChannel.map(
+                FileChannel.MapMode.READ_ONLY,
+                startOffset,
+                declaredLength
+            ).apply {
+                order(ByteOrder.nativeOrder())
             }
         } catch (e: Exception) {
             throw RuntimeException("Model file not found: ${MODEL_PATH}. Please add the YOLO model to assets folder", e)
@@ -149,13 +135,14 @@ class YoloDetector(private val context: Context) {
 
     fun detectPeople(imageProxy: ImageProxy): List<Detection> {
         return try {
-            if (interpreter == null) {
-                Timber.w("Interpreter is null, cannot detect people")
-                return emptyList()
+            // FIXED: Safe conversion with proper synchronization
+            val bitmap = safeImageProxyToBitmap(imageProxy)
+            if (bitmap != null) {
+                detect(bitmap)
+            } else {
+                Timber.w("Failed to convert ImageProxy to Bitmap")
+                emptyList()
             }
-
-            val bitmap = imageProxyToBitmap(imageProxy)
-            detect(bitmap)
         } catch (e: Exception) {
             Timber.e(e, "Error detecting people from ImageProxy")
             emptyList()
@@ -170,12 +157,48 @@ class YoloDetector(private val context: Context) {
 
         return try {
             val inputBuffer = preprocessImage(bitmap)
-            val outputBuffer = Array(1) { Array(outputSize) { FloatArray(85) } }
 
-            // Run inference with timeout handling
-            interpreter.run(inputBuffer, outputBuffer)
+            // Ask the model what the output shape is
+            val shape = interpreter.getOutputTensor(0).shape() // e.g. [1,25200,85] or [1,84,8400] or [1,8400,84]
+            require(shape.size == 3) { "Unexpected output rank: ${shape.contentToString()}" }
+            val s1 = shape[1]
+            val s2 = shape[2]
 
-            processOutputs(outputBuffer[0], bitmap.width, bitmap.height)
+            // Allocate a container that matches the tensor exactly
+            val rawOut: Any = when {
+                s1 == 25200 && s2 == 85   -> Array(1) { Array(25200) { FloatArray(85) } }    // YOLOv5-style
+                s1 == 84    && s2 == 8400 -> Array(1) { Array(84)    { FloatArray(8400) } }  // YOLOv8 (channels-first)
+                s1 == 8400 && s2 == 84    -> Array(1) { Array(8400) { FloatArray(84) } }     // YOLOv8 (channels-last)
+                else -> error("Unsupported output shape: ${shape.contentToString()}")
+            }
+
+            // Run inference
+            interpreter.run(inputBuffer, rawOut)
+
+            // Normalize to rows = candidates, cols = features
+            val rows: Array<FloatArray> = when {
+                // already [N, D]
+                s1 == 25200 && s2 == 85 -> {
+                    @Suppress("UNCHECKED_CAST")
+                    (rawOut as Array<Array<FloatArray>>)[0]
+                }
+                // already [N, D]
+                s1 == 8400 && s2 == 84 -> {
+                    @Suppress("UNCHECKED_CAST")
+                    (rawOut as Array<Array<FloatArray>>)[0]
+                }
+                // need transpose: [84, 8400] -> [8400, 84]
+                s1 == 84 && s2 == 8400 -> {
+                    @Suppress("UNCHECKED_CAST")
+                    val chMajor = (rawOut as Array<Array<FloatArray>>)[0] // [84][8400]
+                    val n = 8400; val d = 84
+                    Array(n) { j -> FloatArray(d) { i -> chMajor[i][j] } }
+                }
+                else -> error("Unsupported output shape after run: ${shape.contentToString()}")
+            }
+
+            // Your existing logic continues via processOutputs()
+            processOutputs(rows, bitmap.width, bitmap.height)
 
         } catch (e: Exception) {
             Timber.e(e, "Error during detection inference")
@@ -183,20 +206,17 @@ class YoloDetector(private val context: Context) {
         }
     }
 
+
     private fun preprocessImage(bitmap: Bitmap): ByteBuffer {
-        // Resize bitmap to model input size with proper scaling
         val resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
 
-        // Allocate buffer for RGB values (3 channels * 4 bytes per float)
         val inputBuffer = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4)
         inputBuffer.order(ByteOrder.nativeOrder())
         inputBuffer.rewind()
 
-        // Get pixel values
         val pixels = IntArray(inputSize * inputSize)
         resizedBitmap.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
 
-        // Convert pixels to normalized RGB float values (0.0 to 1.0)
         for (pixel in pixels) {
             val r = ((pixel shr 16) and 0xFF) / 255.0f
             val g = ((pixel shr 8) and 0xFF) / 255.0f
@@ -207,85 +227,100 @@ class YoloDetector(private val context: Context) {
             inputBuffer.putFloat(b)
         }
 
-        // Clean up temporary bitmap if it's different from original
-        if (resizedBitmap != bitmap && !resizedBitmap.isRecycled) {
-            resizedBitmap.recycle()
-        }
-
         return inputBuffer
     }
 
     private fun processOutputs(outputs: Array<FloatArray>, imgWidth: Int, imgHeight: Int): List<Detection> {
         val detections = mutableListOf<Detection>()
 
-        for (i in outputs.indices) {
-            val output = outputs[i]
+        for (row in outputs) {
+            when (row.size) {
+                85 -> {
+                    // YOLOv5-style: [cx, cy, w, h, obj, 80 class scores]
+                    val obj = row[4]
+                    if (obj < CONFIDENCE_THRESHOLD) continue
 
-            // Validate output array size
-            if (output.size < 85) {
-                Timber.w("Output array too small: ${output.size}, expected at least 85")
-                continue
-            }
+                    val classScores = row.copyOfRange(5, 85)
+                    val cls = classScores.indices.maxByOrNull { classScores[it] } ?: 0
+                    val clsScore = classScores[cls]
+                    if (cls != PERSON_CLASS) continue
 
-            // YOLO format: [x, y, w, h, objectness, class_scores...]
-            val objectness = output[4]
-
-            if (objectness > CONFIDENCE_THRESHOLD) {
-                // Get class scores (80 classes starting at index 5)
-                val classScores = output.sliceArray(5..84)
-                val maxClassIndex = classScores.indices.maxByOrNull { classScores[it] } ?: 0
-                val maxClassScore = classScores[maxClassIndex]
-
-                // We only want person detections (class 0)
-                if (maxClassIndex == PERSON_CLASS) {
-                    val confidence = objectness * maxClassScore
-
-                    if (confidence > CONFIDENCE_THRESHOLD) {
-                        // Convert YOLO coordinates to image coordinates
-                        val cx = output[0] * imgWidth / inputSize
-                        val cy = output[1] * imgHeight / inputSize
-                        val w = output[2] * imgWidth / inputSize
-                        val h = output[3] * imgHeight / inputSize
-
-                        // Validate coordinates
-                        if (w > 0 && h > 0) {
-                            // Convert center coordinates to corner coordinates
-                            val left = (cx - w / 2).coerceAtLeast(0f)
-                            val top = (cy - h / 2).coerceAtLeast(0f)
-                            val right = (cx + w / 2).coerceAtMost(imgWidth.toFloat())
-                            val bottom = (cy + h / 2).coerceAtMost(imgHeight.toFloat())
-
-                            // Ensure valid bounding box
-                            if (right > left && bottom > top) {
-                                detections.add(
-                                    Detection(
-                                        bbox = RectF(left, top, right, bottom),
-                                        confidence = confidence,
-                                        classId = PERSON_CLASS
-                                    )
-                                )
-                            }
-                        }
+                    val confidence = obj * clsScore
+                    if (confidence >= CONFIDENCE_THRESHOLD) {
+                        detections.add(
+                            toDetection(
+                                cx = row[0], cy = row[1], w = row[2], h = row[3],
+                                confidence = confidence,
+                                imgWidth = imgWidth, imgHeight = imgHeight
+                            )
+                        )
                     }
+                }
+
+                84 -> {
+                    // YOLOv8-style: [cx, cy, w, h, 80 class scores] (no separate objness)
+                    val classScores = row.copyOfRange(4, 84)
+                    val cls = classScores.indices.maxByOrNull { classScores[it] } ?: 0
+                    val clsScore = classScores[cls]
+                    if (cls != PERSON_CLASS) continue
+
+                    val confidence = clsScore
+                    if (confidence >= CONFIDENCE_THRESHOLD) {
+                        detections.add(
+                            toDetection(
+                                cx = row[0], cy = row[1], w = row[2], h = row[3],
+                                confidence = confidence,
+                                imgWidth = imgWidth, imgHeight = imgHeight
+                            )
+                        )
+                    }
+                }
+
+                else -> {
+                    // Unknown format row, skip
+                    continue
                 }
             }
         }
 
-        // Apply Non-Maximum Suppression
         return nonMaxSuppression(detections)
     }
+    private fun toDetection(
+        cx: Float,
+        cy: Float,
+        w: Float,
+        h: Float,
+        confidence: Float,
+        imgWidth: Int,
+        imgHeight: Int
+    ): Detection {
+        // Your math, unchanged — convert from model space to image space
+        val sx = imgWidth / inputSize.toFloat()
+        val sy = imgHeight / inputSize.toFloat()
+
+        val cxPix = cx * sx
+        val cyPix = cy * sy
+        val wPix  = w  * sx
+        val hPix  = h  * sy
+
+        val left   = (cxPix - wPix / 2f).coerceAtLeast(0f)
+        val top    = (cyPix - hPix / 2f).coerceAtLeast(0f)
+        val right  = (cxPix + wPix / 2f).coerceAtMost(imgWidth.toFloat())
+        val bottom = (cyPix + hPix / 2f).coerceAtMost(imgHeight.toFloat())
+
+        return Detection(RectF(left, top, right, bottom), confidence, PERSON_CLASS)
+    }
+
 
     private fun nonMaxSuppression(detections: List<Detection>): List<Detection> {
         if (detections.isEmpty()) return emptyList()
 
-        // Sort by confidence (highest first)
         val sorted = detections.sortedByDescending { it.confidence }
         val selected = mutableListOf<Detection>()
 
         for (detection in sorted) {
             var keep = true
 
-            // Check IoU with already selected detections
             for (selectedDetection in selected) {
                 if (calculateIoU(detection.bbox, selectedDetection.bbox) > IOU_THRESHOLD) {
                     keep = false
@@ -318,54 +353,126 @@ class YoloDetector(private val context: Context) {
         return if (unionArea > 0) intersectionArea / unionArea else 0f
     }
 
-    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
+    // FIXED: Safer ImageProxy to Bitmap conversion
+    private fun safeImageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
         return try {
             val planes = imageProxy.planes
-            val yBuffer = planes[0].buffer
-            val uBuffer = planes[1].buffer
-            val vBuffer = planes[2].buffer
+
+            // Check if planes are valid
+            if (planes.size < 3) {
+                Timber.e("Invalid number of planes: ${planes.size}")
+                return null
+            }
+
+            // Safely get buffers
+            val yPlane = planes[0]
+            val uPlane = planes[1]
+            val vPlane = planes[2]
+
+            val yBuffer = yPlane.buffer
+            val uBuffer = uPlane.buffer
+            val vBuffer = vPlane.buffer
+
+            // Check buffer validity
+            if (!yBuffer.hasRemaining() || !uBuffer.hasRemaining() || !vBuffer.hasRemaining()) {
+                Timber.e("One or more buffers are empty")
+                return null
+            }
 
             val ySize = yBuffer.remaining()
             val uSize = uBuffer.remaining()
             val vSize = vBuffer.remaining()
 
+            // Create NV21 byte array
             val nv21 = ByteArray(ySize + uSize + vSize)
 
-            // Copy YUV data
+            // Copy data safely
             yBuffer.get(nv21, 0, ySize)
-            vBuffer.get(nv21, ySize, vSize)
-            uBuffer.get(nv21, ySize + vSize, uSize)
+            val vOffset = ySize
+            val uOffset = ySize + vSize
+            vBuffer.get(nv21, vOffset, vSize)
+            uBuffer.get(nv21, uOffset, uSize)
 
-            // Convert to JPEG via YuvImage
-            val yuvImage = YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
+            // Convert to Bitmap
+            val yuvImage = YuvImage(
+                nv21,
+                ImageFormat.NV21,
+                imageProxy.width,
+                imageProxy.height,
+                null
+            )
+
             val out = java.io.ByteArrayOutputStream()
-            yuvImage.compressToJpeg(Rect(0, 0, imageProxy.width, imageProxy.height), 100, out)
+            val rect = Rect(0, 0, imageProxy.width, imageProxy.height)
+
+            if (!yuvImage.compressToJpeg(rect, 100, out)) {
+                Timber.e("Failed to compress YUV to JPEG")
+                return null
+            }
 
             val imageBytes = out.toByteArray()
-            BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-                ?: throw RuntimeException("Failed to decode image bytes to bitmap")
+            return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
 
         } catch (e: Exception) {
             Timber.e(e, "Error converting ImageProxy to Bitmap")
-            // Create a fallback bitmap to prevent crashes
-            Bitmap.createBitmap(1, 1, Bitmap.Config.RGB_565)
+            null
         }
     }
 
-    private fun cleanup() {
-        try {
-            gpuDelegate?.close()
-            gpuDelegate = null
+    // Alternative simpler conversion method if the above still crashes
+    @OptIn(ExperimentalGetImage::class)
+    private fun imageProxyToBitmapSimple(imageProxy: ImageProxy): Bitmap? {
+        return try {
+            // Get the image from ImageProxy
+            val image = imageProxy.image ?: return null
+
+            val planes = image.planes
+            val yPlane = planes[0]
+            val uPlane = planes[1]
+            val vPlane = planes[2]
+
+            val ySize = yPlane.buffer.remaining()
+            val uSize = uPlane.buffer.remaining()
+            val vSize = vPlane.buffer.remaining()
+
+            val nv21 = ByteArray(ySize + uSize + vSize)
+
+            yPlane.buffer.get(nv21, 0, ySize)
+            val uvPixelStride = uPlane.pixelStride
+
+            if (uvPixelStride == 1) {
+                uPlane.buffer.get(nv21, ySize, uSize)
+                vPlane.buffer.get(nv21, ySize + uSize, vSize)
+            } else {
+                // Interleaved UV
+                val uvBuffer = ByteArray(uSize + vSize)
+                vPlane.buffer.get(uvBuffer, 0, vSize)
+                uPlane.buffer.get(uvBuffer, vSize, uSize)
+
+                var nv21Index = ySize
+                for (i in 0 until min(uSize, vSize)) {
+                    nv21[nv21Index++] = uvBuffer[i * 2 + vSize]
+                    nv21[nv21Index++] = uvBuffer[i * 2]
+                }
+            }
+
+            val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+            val out = java.io.ByteArrayOutputStream()
+            yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 100, out)
+
+            val imageBytes = out.toByteArray()
+            BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+
         } catch (e: Exception) {
-            Timber.w(e, "Error closing GPU delegate")
+            Timber.e(e, "Error in simple conversion")
+            null
         }
     }
 
     fun close() {
         try {
             interpreter?.close()
-            interpreter = null
-            cleanup()
+            gpuDelegate?.close()
             Timber.d("YOLO detector closed")
         } catch (e: Exception) {
             Timber.e(e, "Error closing YOLO detector")
